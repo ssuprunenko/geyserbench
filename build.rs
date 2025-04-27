@@ -62,5 +62,27 @@ fn main() -> anyhow::Result<()> {
         )
         .build()]);
 
+    tonic_build::configure()
+        .file_descriptor_set_path(
+            PathBuf::from(env::var("OUT_DIR").unwrap()).join("shredstream_descriptor.bin"),
+        )
+        .compile_protos(&[mpath("proto/shredstream.proto")], &[mpath("proto")])?;
+
+    Builder::new().compile(&[Service::builder()
+        .name("ShrederService")
+        .package("shredstream")
+        .method(
+            Method::builder()
+                .name("subscribe_transactions")
+                .route_name("SubscribeTransactions")
+                .client_streaming()
+                .server_streaming()
+                .input_type("crate::shredstream::SubscribeTransactionsRequest")
+                .output_type("crate::shredstream::SubscribeTransactionsResponse")
+                .codec_path("tonic::codec::ProstCodec")
+                .build(),
+        )
+        .build()]);
+
     Ok(())
 }

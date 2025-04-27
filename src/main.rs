@@ -5,8 +5,14 @@ pub use {
     },
     bs58,
     bytes::Bytes,
+    futures::channel::mpsc::unbounded,
     futures_util::{sink::SinkExt, stream::StreamExt},
     serde::{Deserialize, Serialize},
+    shredstream::{
+        shreder_service_client::ShrederServiceClient,
+        SubscribeTransactionsRequest as ShrederSubscribeTransactionsRequest,
+        SubscribeTransactionsResponse as ShrederSubscribeTransactionsResponse,
+    },
     std::{
         collections::HashMap,
         env,
@@ -18,6 +24,7 @@ pub use {
     },
     tokio::{signal::ctrl_c, sync::broadcast, task},
     tokio_stream::Stream,
+    tonic::{Response, Streaming},
     yellowstone_grpc_client::GeyserGrpcClient,
     yellowstone_grpc_proto::{
         geyser::{
@@ -35,6 +42,16 @@ pub mod arpc {
     include!(concat!(env!("OUT_DIR"), "/arpc.rs"));
 
     pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("arpc_descriptor");
+}
+
+pub mod shredstream {
+    #![allow(clippy::clone_on_ref_ptr)]
+    #![allow(clippy::missing_const_for_fn)]
+
+    include!(concat!(env!("OUT_DIR"), "/shredstream.rs"));
+
+    pub const FILE_DESCRIPTOR_SET: &[u8] =
+        tonic::include_file_descriptor_set!("shredstream_descriptor");
 }
 
 mod config;
@@ -542,6 +559,112 @@ async fn process_arpc_endpoint(
     Ok(())
 }
 
+async fn process_shredstream_endpoint(
+    endpoint: Endpoint,
+    config: Config,
+    shutdown_tx: broadcast::Sender<()>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+    start_time: f64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut transaction_count = 0;
+
+    let log_filename = format!("transaction_log_{}.txt", endpoint.name);
+    let mut log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_filename)
+        .expect("Failed to open log file");
+
+    log::info!(
+        "[{}] Connecting to endpoint: {}",
+        endpoint.name,
+        endpoint.url
+    );
+
+    let mut client = ShrederServiceClient::connect(endpoint.url).await?;
+    log::info!("[{}] Connected successfully", endpoint.name);
+
+    let mut transactions: HashMap<String, shredstream::SubscribeRequestFilterTransactions> =
+        HashMap::new();
+    transactions.insert(
+        String::from("account"),
+        shredstream::SubscribeRequestFilterTransactions {
+            account_exclude: vec![],
+            account_include: vec![],
+            account_required: vec![config.account.clone()],
+        },
+    );
+
+    let request = shredstream::SubscribeTransactionsRequest { transactions };
+
+    let (mut subscribe_tx, subscribe_rx) = unbounded::<shredstream::SubscribeTransactionsRequest>();
+    subscribe_tx.send(request).await?;
+    let mut stream = client
+        .subscribe_transactions(subscribe_rx)
+        .await?
+        .into_inner();
+
+    'ploop: loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                log::info!("[{}] Received stop signal...", endpoint.name);
+                break;
+            }
+
+            message = stream.next() => {
+                if let Some(Ok(msg)) = message {
+                    if let Some(tx) = msg.transaction {
+                        let accounts = tx.transaction.clone().unwrap().message.unwrap().account_keys
+                            .iter()
+                            .map(|key| bs58::encode(key).into_string())
+                            .collect::<Vec<String>>();
+
+                        if accounts.contains(&config.account) {
+                            let timestamp = get_current_timestamp();
+                            let signature = bs58::encode(&tx.transaction.unwrap().signatures[0]).into_string();
+
+                            let log_entry = format!(
+                                "[{:.3}] [{}] {}\n",
+                                timestamp,
+                                endpoint.name,
+                                signature
+                            );
+
+                            log_file.write_all(log_entry.as_bytes())
+                                .expect("Failed to write to log file");
+
+                                let mut comp = COMPARATOR.lock().unwrap();
+
+                                comp.add(
+                                    endpoint.name.clone(),
+                                    TransactionData {
+                                        timestamp,
+
+                                        signature: signature.clone(),
+                                        start_time,
+                                    },
+                                );
+                                if comp.get_valid_count() == config.transactions as usize {
+                                    log::info!("Endpoint {} shutting down after {} transactions seen and {} by all workers", endpoint.name, transaction_count, config.transactions);
+                                    shutdown_tx.send(()).unwrap();
+                                    break 'ploop;
+                                }
+
+
+                            log::info!("{}", log_entry.trim());
+                            transaction_count += 1;
+                        }
+                    }
+                }
+
+            }
+        }
+    }
+
+    log::info!("[{}] Stream closed", endpoint.name);
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -574,6 +697,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(e) =
                     process_arpc_endpoint(endpoint.clone(), config, stx, shutdown_rx, start_time)
                         .await
+                {
+                    log::error!("[{}] Error processing endpoint: {:?}", endpoint.name, e);
+                }
+            })),
+            EndpointKind::Shreder => handles.push(task::spawn(async move {
+                if let Err(e) = process_shredstream_endpoint(
+                    endpoint.clone(),
+                    config,
+                    stx,
+                    shutdown_rx,
+                    start_time,
+                )
+                .await
                 {
                     log::error!("[{}] Error processing endpoint: {:?}", endpoint.name, e);
                 }
