@@ -84,5 +84,27 @@ fn main() -> anyhow::Result<()> {
         )
         .build()]);
 
+    tonic_build::configure()
+        .file_descriptor_set_path(
+            PathBuf::from(env::var("OUT_DIR").unwrap()).join("jetstream_descriptor.bin"),
+        )
+        .compile_protos(&[mpath("proto/jetstream.proto")], &[mpath("proto")])?;
+
+    Builder::new().compile(&[Service::builder()
+        .name("Jetstream")
+        .package("jetstream")
+        .method(
+            Method::builder()
+                .name("subscribe")
+                .route_name("Subscribe")
+                .client_streaming()
+                .server_streaming()
+                .input_type("crate::jetstream::SubscribeRequest")
+                .output_type("crate::jetstream::SubscribeUpdate")
+                .codec_path("tonic::codec::ProstCodec")
+                .build(),
+        )
+        .build()]);
+
     Ok(())
 }
